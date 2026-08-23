@@ -10,6 +10,7 @@ on:
     paths:
       - '.github/workflows/tarsnap-bounty-audit.yml'
       - 'tools/tarsnap_audit.py'
+      - 'tools/tarsnap_keyfile_fuzz.py'
       - 'tools/tarsnap_cache_probe.py'
   workflow_dispatch:
 
@@ -19,7 +20,7 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 60
     env:
       TARSNAP_SHA: 0bf0b299fed91139044c81cc6fcdc5521c34d235
     steps:
@@ -45,7 +46,7 @@ jobs:
       - name: Generate mechanical candidate inventory
         run: |
           python3 tools/tarsnap_audit.py tarsnap --output audit-candidates.md
-          python3 -m py_compile tools/tarsnap_audit.py
+          python3 -m py_compile tools/tarsnap_audit.py tools/tarsnap_keyfile_fuzz.py
           sed -n '1,260p' audit-candidates.md
 
       - name: Configure and build with ASan and UBSan
@@ -71,6 +72,23 @@ jobs:
           set -o pipefail
           cd tarsnap
           make check 2>&1 | tee ../tests-sanitizers.log
+
+      - name: Mutate official keyfile fixture under sanitizers
+        id: keyfile_fuzz
+        continue-on-error: true
+        shell: bash
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -o pipefail
+          python3 tools/tarsnap_keyfile_fuzz.py \
+            --binary tarsnap/tarsnap-keymgmt \
+            --seed tarsnap/tests/fake.keys \
+            --iterations 3000 \
+            --timeout 2.0 \
+            --output keyfile-fuzz-out \
+            2>&1 | tee keyfile-fuzz.log
 
       - name: Run cppcheck on first-party source
         continue-on-error: true
@@ -122,12 +140,15 @@ jobs:
             echo
             echo "Pinned revision: $TARSNAP_SHA"
             echo
+            echo '## Keyfile mutation campaign'
+            cat keyfile-fuzz-out/summary.md 2>/dev/null || true
+            echo
             echo '## cppcheck high-signal lines'
             grep -Ei 'error|warning|buffer|overflow|underflow|null|useAfterFree|doubleFree|memleak|uninit|outOfBounds|invalid' cppcheck.txt 2>/dev/null | head -n 300 || true
             echo
             echo '## Sanitizer/test signals'
             grep -RniE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|heap-use-after-free|double free|buffer-overflow|SEGV|ABRT|Assertion' \
-              ./*.log 2>/dev/null | head -n 300 || true
+              ./*.log keyfile-fuzz-out/*.stderr 2>/dev/null | head -n 300 || true
             echo
             echo '## scan-build report files'
             find scan-build-out -type f 2>/dev/null | sort | head -n 300 || true
@@ -148,6 +169,8 @@ jobs:
             configure-sanitizers.log
             build-sanitizers.log
             tests-sanitizers.log
+            keyfile-fuzz.log
+            keyfile-fuzz-out/
             distclean.log
             configure-analyzer.log
             cppcheck.txt
