@@ -1,0 +1,219 @@
+name: Tarsnap bounty audit
+
+on:
+  push:
+    branches:
+      - audit/tarsnap-bounty-20260823
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/tarsnap-bounty-audit.yml'
+      - 'tools/tarsnap_audit.py'
+      - 'tools/tarsnap_keyfile_fuzz.py'
+      - 'tools/tarsnap_cachedir_fuzz.py'
+      - 'tools/tarsnap_cache_probe.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TARSNAP_SHA: 0bf0b299fed91139044c81cc6fcdc5521c34d235
+    steps:
+      - name: Checkout audit tooling
+        uses: actions/checkout@v4
+
+      - name: Install analysis toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake build-essential clang \
+            libacl1-dev libattr1-dev libbz2-dev libext2fs-dev liblzma-dev \
+            libssl-dev libtool pkg-config python3 zlib1g-dev
+
+      - name: Fetch pinned Tarsnap source
+        run: |
+          git clone https://github.com/Tarsnap/tarsnap.git tarsnap
+          cd tarsnap
+          git checkout "$TARSNAP_SHA"
+          test "$(git rev-parse HEAD)" = "$TARSNAP_SHA"
+          git status --short
+          cd ..
+          tar -czf tarsnap-pinned-source.tar.gz tarsnap
+
+      - name: Validate audit tooling
+        run: |
+          python3 tools/tarsnap_audit.py tarsnap --output audit-candidates.md
+          python3 -m py_compile \
+            tools/tarsnap_audit.py \
+            tools/tarsnap_keyfile_fuzz.py \
+            tools/tarsnap_cachedir_fuzz.py
+
+      - name: Configure and build with ASan and UBSan
+        shell: bash
+        run: |
+          set -o pipefail
+          cd tarsnap
+          autoreconf -fi 2>&1 | tee ../autoreconf.log
+          ./configure \
+            CC=clang \
+            CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' \
+            LDFLAGS='-fsanitize=address,undefined' \
+            2>&1 | tee ../configure-sanitizers.log
+          make -j2 2>&1 | tee ../build-sanitizers.log
+
+      - name: Run upstream tests under sanitizers
+        shell: bash
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -o pipefail
+          cd tarsnap
+          make check 2>&1 | tee ../tests-sanitizers.log
+
+      - name: Reproduce empty elasticarray export UB on valid workflow
+        id: baseline_ub
+        continue-on-error: true
+        shell: bash
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -o pipefail
+          ROOT="$PWD"
+          PROOF="$(mktemp -d)"
+          mkdir -p "$PROOF/cache"
+          "$ROOT/tarsnap/tarsnap" --no-default-config \
+            --keyfile "$ROOT/tarsnap/tests/fake.keys" \
+            --cachedir "$PROOF/cache" --initialize-cachedir \
+            > baseline-init.stdout 2> baseline-init.stderr
+          "$ROOT/tarsnap/tarsnap" --no-default-config \
+            --keyfile "$ROOT/tarsnap/tests/fake.keys" \
+            --cachedir "$PROOF/cache" \
+            -c --dry-run --print-stats "$ROOT/tarsnap/tests/test_tarsnap.sh" \
+            > baseline-empty-export.stdout 2> baseline-empty-export.stderr
+
+      - name: Apply audit-only fix for known empty-export UB
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tarsnap/libcperciva/datastruct/elasticarray.c')
+          s = p.read_text()
+          old = '''\t/* Allocate buffer for the caller's copy of the data. */
+          \tif ((*buf = malloc(EA->size)) == NULL)
+          \t\tgoto err0;
+
+          \t/* Copy the data in. */
+          \tmemcpy(*buf, EA->buf, EA->size);
+          '''
+          new = '''\t/* Empty arrays have no backing allocation to copy. */
+          \tif (EA->size == 0) {
+          \t\t*buf = NULL;
+          \t\t*nrec = 0;
+          \t\treturn (0);
+          \t}
+
+          \t/* Allocate buffer for the caller's copy of the data. */
+          \tif ((*buf = malloc(EA->size)) == NULL)
+          \t\tgoto err0;
+
+          \t/* Copy the data in. */
+          \tmemcpy(*buf, EA->buf, EA->size);
+          '''
+          if old not in s:
+              raise SystemExit('expected elasticarray_exportdup block not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git -C tarsnap diff -- libcperciva/datastruct/elasticarray.c \
+            | tee audit-only-empty-export.patch
+          make -C tarsnap -j2 2>&1 | tee rebuild-after-audit-patch.log
+
+      - name: Confirm valid workflow passes after audit-only fix
+        shell: bash
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -o pipefail
+          ROOT="$PWD"
+          PROOF="$(mktemp -d)"
+          mkdir -p "$PROOF/cache"
+          "$ROOT/tarsnap/tarsnap" --no-default-config \
+            --keyfile "$ROOT/tarsnap/tests/fake.keys" \
+            --cachedir "$PROOF/cache" --initialize-cachedir
+          "$ROOT/tarsnap/tarsnap" --no-default-config \
+            --keyfile "$ROOT/tarsnap/tests/fake.keys" \
+            --cachedir "$PROOF/cache" \
+            -c --dry-run --print-stats "$ROOT/tarsnap/tests/test_tarsnap.sh" \
+            2>&1 | tee baseline-after-audit-patch.log
+
+      - name: Mutate an initialized cachedir under sanitizers
+        id: cachedir_fuzz
+        continue-on-error: true
+        shell: bash
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -o pipefail
+          python3 tools/tarsnap_cachedir_fuzz.py \
+            --binary tarsnap/tarsnap \
+            --keyfile tarsnap/tests/fake.keys \
+            --sample tarsnap/tests/test_tarsnap.sh \
+            --iterations 3000 \
+            --timeout 3.0 \
+            --output cachedir-fuzz-out \
+            2>&1 | tee cachedir-fuzz.log
+
+      - name: Summarize evidence
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '# Tarsnap cachedir audit summary'
+            echo
+            echo "Pinned revision: $TARSNAP_SHA"
+            echo
+            echo '## Valid-workflow baseline UB'
+            cat baseline-empty-export.stderr 2>/dev/null || true
+            echo
+            echo '## Cachedir mutation campaign'
+            cat cachedir-fuzz-out/summary.md 2>/dev/null || true
+            echo
+            echo '## Sanitizer signals'
+            grep -RniE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|heap-use-after-free|double free|buffer-overflow|SEGV|ABRT|Assertion' \
+              ./*.log ./*.stderr cachedir-fuzz-out/*.stderr 2>/dev/null | head -n 500 || true
+          } > audit-summary.md
+          cat audit-summary.md
+
+      - name: Upload audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarsnap-bounty-audit-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            audit-candidates.md
+            audit-summary.md
+            autoreconf.log
+            configure-sanitizers.log
+            build-sanitizers.log
+            tests-sanitizers.log
+            baseline-init.stdout
+            baseline-init.stderr
+            baseline-empty-export.stdout
+            baseline-empty-export.stderr
+            audit-only-empty-export.patch
+            rebuild-after-audit-patch.log
+            baseline-after-audit-patch.log
+            cachedir-fuzz.log
+            cachedir-fuzz-out/
+            tarsnap-pinned-source.tar.gz
