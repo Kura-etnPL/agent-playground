@@ -1,0 +1,141 @@
+name: Tarsnap bounty audit
+
+on:
+  push:
+    branches:
+      - audit/tarsnap-bounty-20260823
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TARSNAP_SHA: 0bf0b299fed91139044c81cc6fcdc5521c34d235
+    steps:
+      - name: Checkout audit tooling
+        uses: actions/checkout@v4
+
+      - name: Install analysis toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake build-essential clang clang-tools cppcheck \
+            libssl-dev libtool pkg-config python3
+
+      - name: Fetch pinned Tarsnap source
+        run: |
+          git clone https://github.com/Tarsnap/tarsnap.git tarsnap
+          cd tarsnap
+          git checkout "$TARSNAP_SHA"
+          test "$(git rev-parse HEAD)" = "$TARSNAP_SHA"
+          git status --short
+
+      - name: Generate mechanical candidate inventory
+        run: |
+          python3 tools/tarsnap_audit.py tarsnap --output audit-candidates.md
+          python3 -m py_compile tools/tarsnap_audit.py
+          sed -n '1,260p' audit-candidates.md
+
+      - name: Build with ASan and UBSan
+        id: sanitizer_build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cd tarsnap
+          autoreconf -fi 2>&1 | tee ../autoreconf.log
+          ./configure \
+            CC=clang \
+            CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' \
+            LDFLAGS='-fsanitize=address,undefined' \
+            2>&1 | tee ../configure-sanitizers.log
+          make -j2 2>&1 | tee ../build-sanitizers.log
+
+      - name: Run upstream tests under sanitizers
+        if: steps.sanitizer_build.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -o pipefail
+          cd tarsnap
+          make check 2>&1 | tee ../tests-sanitizers.log
+
+      - name: Run cppcheck
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cppcheck \
+            --enable=warning,performance,portability \
+            --inconclusive --force --std=c99 \
+            --suppress=missingIncludeSystem \
+            --xml --xml-version=2 tarsnap \
+            2> cppcheck.xml
+          cppcheck \
+            --enable=warning,performance,portability \
+            --inconclusive --force --std=c99 \
+            --suppress=missingIncludeSystem \
+            --template='{file}:{line}: {severity}: {id}: {message}' \
+            tarsnap 2> cppcheck.txt
+          sed -n '1,500p' cppcheck.txt
+
+      - name: Run Clang static analyzer
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cd tarsnap
+          make clean || true
+          scan-build \
+            --keep-empty \
+            --status-bugs \
+            -o ../scan-build-out \
+            make -j2 \
+            2>&1 | tee ../scan-build.log
+
+      - name: Summarize highest-signal diagnostics
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '# Tarsnap audit run summary'
+            echo
+            echo "Pinned revision: $TARSNAP_SHA"
+            echo
+            echo '## cppcheck high-signal lines'
+            grep -Ei 'error|warning|buffer|overflow|underflow|null|useAfterFree|doubleFree|memleak|uninit|outOfBounds|invalid' cppcheck.txt 2>/dev/null | head -n 300 || true
+            echo
+            echo '## Sanitizer/test signals'
+            grep -RniE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|heap-use-after-free|double free|buffer-overflow|SEGV|ABRT|Assertion' \
+              ./*.log 2>/dev/null | head -n 300 || true
+            echo
+            echo '## scan-build report files'
+            find scan-build-out -type f 2>/dev/null | sort | head -n 300 || true
+          } > audit-summary.md
+          cat audit-summary.md
+
+      - name: Upload audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarsnap-bounty-audit-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            audit-candidates.md
+            audit-summary.md
+            autoreconf.log
+            configure-sanitizers.log
+            build-sanitizers.log
+            tests-sanitizers.log
+            cppcheck.txt
+            cppcheck.xml
+            scan-build.log
+            scan-build-out/
