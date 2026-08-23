@@ -7,10 +7,20 @@ on:
     paths:
       - .github/workflows/tarsnap-bounty-audit.yml
       - research/tarsnap/**
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/tarsnap-bounty-audit.yml
+      - research/tarsnap/**
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: tarsnap-bounty-audit-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   snapshot-build:
