@@ -11,6 +11,7 @@ on:
       - '.github/workflows/tarsnap-bounty-audit.yml'
       - 'tools/tarsnap_audit.py'
       - 'tools/tarsnap_keyfile_fuzz.py'
+      - 'tools/tarsnap_cachedir_fuzz.py'
       - 'tools/tarsnap_cache_probe.py'
   workflow_dispatch:
 
@@ -20,7 +21,7 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 55
     env:
       TARSNAP_SHA: 0bf0b299fed91139044c81cc6fcdc5521c34d235
     steps:
@@ -31,7 +32,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            autoconf automake build-essential clang clang-tools cppcheck \
+            autoconf automake build-essential clang \
             libacl1-dev libattr1-dev libbz2-dev libext2fs-dev liblzma-dev \
             libssl-dev libtool pkg-config python3 zlib1g-dev
 
@@ -42,15 +43,18 @@ jobs:
           git checkout "$TARSNAP_SHA"
           test "$(git rev-parse HEAD)" = "$TARSNAP_SHA"
           git status --short
+          cd ..
+          tar -czf tarsnap-pinned-source.tar.gz tarsnap
 
-      - name: Generate mechanical candidate inventory
+      - name: Validate audit tooling
         run: |
           python3 tools/tarsnap_audit.py tarsnap --output audit-candidates.md
-          python3 -m py_compile tools/tarsnap_audit.py tools/tarsnap_keyfile_fuzz.py
-          sed -n '1,260p' audit-candidates.md
+          python3 -m py_compile \
+            tools/tarsnap_audit.py \
+            tools/tarsnap_keyfile_fuzz.py \
+            tools/tarsnap_cachedir_fuzz.py
 
       - name: Configure and build with ASan and UBSan
-        id: sanitizer_build
         shell: bash
         run: |
           set -o pipefail
@@ -73,8 +77,8 @@ jobs:
           cd tarsnap
           make check 2>&1 | tee ../tests-sanitizers.log
 
-      - name: Mutate official keyfile fixture under sanitizers
-        id: keyfile_fuzz
+      - name: Mutate an initialized cachedir under sanitizers
+        id: cachedir_fuzz
         continue-on-error: true
         shell: bash
         env:
@@ -82,76 +86,29 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           set -o pipefail
-          python3 tools/tarsnap_keyfile_fuzz.py \
-            --binary tarsnap/tarsnap-keymgmt \
-            --seed tarsnap/tests/fake.keys \
+          python3 tools/tarsnap_cachedir_fuzz.py \
+            --binary tarsnap/tarsnap \
+            --keyfile tarsnap/tests/fake.keys \
+            --sample tarsnap/tests/test_tarsnap.sh \
             --iterations 3000 \
-            --timeout 2.0 \
-            --output keyfile-fuzz-out \
-            2>&1 | tee keyfile-fuzz.log
+            --timeout 3.0 \
+            --output cachedir-fuzz-out \
+            2>&1 | tee cachedir-fuzz.log
 
-      - name: Run cppcheck on first-party source
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -o pipefail
-          TARGETS='tarsnap/keygen tarsnap/keymgmt tarsnap/keyregen tarsnap/recrypt tarsnap/lib tarsnap/lib-platform tarsnap/libcperciva tarsnap/tar'
-          cppcheck \
-            --enable=warning,performance,portability \
-            --inconclusive --force --std=c99 \
-            --suppress=missingIncludeSystem \
-            --xml --xml-version=2 $TARGETS \
-            2> cppcheck.xml
-          cppcheck \
-            --enable=warning,performance,portability \
-            --inconclusive --force --std=c99 \
-            --suppress=missingIncludeSystem \
-            --template='{file}:{line}: {severity}: {id}: {message}' \
-            $TARGETS 2> cppcheck.txt
-          sed -n '1,500p' cppcheck.txt
-
-      - name: Reconfigure for Clang static analyzer
-        shell: bash
-        run: |
-          set -o pipefail
-          cd tarsnap
-          make distclean 2>&1 | tee ../distclean.log
-          ./configure CC=clang CFLAGS='-O1 -g' 2>&1 | tee ../configure-analyzer.log
-
-      - name: Run Clang static analyzer
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -o pipefail
-          cd tarsnap
-          scan-build \
-            --keep-empty \
-            --status-bugs \
-            -o ../scan-build-out \
-            make -j2 \
-            2>&1 | tee ../scan-build.log
-
-      - name: Summarize highest-signal diagnostics
+      - name: Summarize evidence
         if: always()
         shell: bash
         run: |
           {
-            echo '# Tarsnap audit run summary'
+            echo '# Tarsnap cachedir audit summary'
             echo
             echo "Pinned revision: $TARSNAP_SHA"
             echo
-            echo '## Keyfile mutation campaign'
-            cat keyfile-fuzz-out/summary.md 2>/dev/null || true
+            cat cachedir-fuzz-out/summary.md 2>/dev/null || true
             echo
-            echo '## cppcheck high-signal lines'
-            grep -Ei 'error|warning|buffer|overflow|underflow|null|useAfterFree|doubleFree|memleak|uninit|outOfBounds|invalid' cppcheck.txt 2>/dev/null | head -n 300 || true
-            echo
-            echo '## Sanitizer/test signals'
+            echo '## Sanitizer signals'
             grep -RniE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|heap-use-after-free|double free|buffer-overflow|SEGV|ABRT|Assertion' \
-              ./*.log keyfile-fuzz-out/*.stderr 2>/dev/null | head -n 300 || true
-            echo
-            echo '## scan-build report files'
-            find scan-build-out -type f 2>/dev/null | sort | head -n 300 || true
+              ./*.log cachedir-fuzz-out/*.stderr 2>/dev/null | head -n 300 || true
           } > audit-summary.md
           cat audit-summary.md
 
@@ -169,11 +126,6 @@ jobs:
             configure-sanitizers.log
             build-sanitizers.log
             tests-sanitizers.log
-            keyfile-fuzz.log
-            keyfile-fuzz-out/
-            distclean.log
-            configure-analyzer.log
-            cppcheck.txt
-            cppcheck.xml
-            scan-build.log
-            scan-build-out/
+            cachedir-fuzz.log
+            cachedir-fuzz-out/
+            tarsnap-pinned-source.tar.gz
