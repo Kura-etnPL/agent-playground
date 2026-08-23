@@ -33,12 +33,18 @@ RULES = [
     Rule(
         "subtraction-in-loop-bound",
         "Unsigned `len - 1 - i` style bounds can underflow for zero-length inputs.",
-        re.compile(r"for\s*\([^;]*;[^;]*(?:<|<=)[^;]*\b[A-Za-z_]\w*\s*-\s*1\s*-\s*[A-Za-z_]\w*[^;]*;", re.S),
+        re.compile(
+            r"for\s*\([^;]*;[^;]*(?:<|<=)[^;]*\b[A-Za-z_]\w*\s*-\s*1\s*-\s*[A-Za-z_]\w*[^;]*;",
+            re.S,
+        ),
     ),
     Rule(
         "addition-in-bound-check",
         "`a + b <= limit` can wrap before the comparison; subtraction form is often safer.",
-        re.compile(r"\bif\s*\([^\n;]{0,180}\b[A-Za-z_]\w*\s*\+\s*\*?[A-Za-z_]\w*\s*(?:<=|<|>=|>)", re.S),
+        re.compile(
+            r"\bif\s*\([^\n;]{0,180}\b[A-Za-z_]\w*\s*\+\s*\*?[A-Za-z_]\w*\s*(?:<=|<|>=|>)",
+            re.S,
+        ),
     ),
     Rule(
         "variable-sized-fread-count-one",
@@ -134,7 +140,8 @@ def main() -> int:
             ]
         )
         for rel, lineno, value in items[:200]:
-            lines.append(f"- `{rel}:{lineno}` — `{value.replace('`', "'")}`")
+            safe_value = value.replace("`", "'")
+            lines.append(f"- `{rel}:{lineno}` — `{safe_value}`")
         if len(items) > 200:
             lines.append(f"- … {len(items) - 200} more omitted")
         lines.append("")
