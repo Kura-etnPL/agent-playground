@@ -1,0 +1,122 @@
+name: Tarsnap bounty audit
+
+on:
+  push:
+    branches:
+      - audit/tarsnap-bounty-2026-08-24
+    paths:
+      - .github/workflows/tarsnap-bounty-audit.yml
+      - research/tarsnap/**
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/tarsnap-bounty-audit.yml
+      - research/tarsnap/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tarsnap-bounty-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  snapshot-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out audit harness
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf \
+            automake \
+            build-essential \
+            libext2fs-dev \
+            libssl-dev \
+            pkg-config \
+            python3 \
+            zlib1g-dev
+
+      - name: Fetch exact upstream source
+        run: |
+          set -euxo pipefail
+          mkdir -p work artifacts logs
+          git clone --depth=1 https://github.com/Tarsnap/tarsnap.git work/tarsnap
+          git -C work/tarsnap submodule update --init --recursive
+          git -C work/tarsnap rev-parse HEAD | tee artifacts/upstream-sha.txt
+          git -C work/tarsnap status --short | tee artifacts/upstream-status.txt
+          tar --exclude=.git -czf artifacts/tarsnap-source.tgz -C work tarsnap
+
+      - name: Build sanitizer-instrumented client
+        id: build
+        shell: bash
+        run: |
+          set +e
+          cd work/tarsnap
+          autoreconf -i > ../../logs/autoreconf.log 2>&1
+          AUTORECONF_RC=$?
+          if [ "$AUTORECONF_RC" -eq 0 ]; then
+            CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all' \
+            LDFLAGS='-fsanitize=address,undefined' \
+              ./configure > ../../logs/configure.log 2>&1
+            CONFIGURE_RC=$?
+          else
+            CONFIGURE_RC=125
+          fi
+          if [ "$CONFIGURE_RC" -eq 0 ]; then
+            make -j2 > ../../logs/make.log 2>&1
+            MAKE_RC=$?
+          else
+            MAKE_RC=125
+          fi
+          {
+            echo "autoreconf=$AUTORECONF_RC"
+            echo "configure=$CONFIGURE_RC"
+            echo "make=$MAKE_RC"
+          } | tee ../../artifacts/build-status.txt
+          if [ -x ./tarsnap ]; then
+            ./tarsnap --version > ../../artifacts/tarsnap-version.txt 2>&1 || true
+            cp ./tarsnap ../../artifacts/tarsnap-asan
+          fi
+          exit 0
+
+      - name: Run environment control probe
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ ! -x work/tarsnap/tarsnap ]; then
+            echo "binary unavailable" > artifacts/control-759.txt
+            exit 0
+          fi
+          mkdir -p work/control
+          printf 'input\n' > work/control/input
+          (
+            cd work/control
+            ASAN_OPTIONS=abort_on_error=1:detect_leaks=0:halt_on_error=1 \
+            UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+              ../tarsnap/tarsnap --no-default-config --dry-run -c -f a \
+              --newer '+1000000000000000000 seconds 1 month' input
+          ) > artifacts/control-759.txt 2>&1
+          echo $? > artifacts/control-759-exit.txt
+          exit 0
+
+      - name: Upload source, binary, and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarsnap-audit-snapshot
+          path: |
+            artifacts/
+            logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
