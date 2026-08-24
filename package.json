@@ -8,10 +8,13 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "npm run dev --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
+    "dev": "concurrently --kill-others \"npm run dev --workspace @taskflow/api\" \"npm run dev --workspace @taskflow/web\"",
+    "test": "npm run test --workspaces --if-present && node --test scripts/dev-orchestration.test.mjs",
     "lint": "npm run lint --workspaces --if-present",
     "format": "npm run format --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.5"
   },
   "engines": {
     "node": ">=20"
